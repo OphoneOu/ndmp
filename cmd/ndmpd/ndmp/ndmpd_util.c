@@ -61,8 +61,13 @@
 #include <netdb.h>
 #include <sys/filio.h>
 #include <sys/mtio.h>
+#ifdef __linux__
+#include <scsi/sg.h>
+#include <scsi/scsi.h>
+#else
 #include <sys/scsi/impl/uscsi.h>
 #include <sys/scsi/scsi.h>
+#endif
 #include "tlm.h"
 
 /*
@@ -1337,102 +1342,199 @@ void
 ndmp_execute_cdb(ndmpd_session_t *session, char *adapter_name, int sid, int lun,
     ndmp_execute_cdb_request *request)
 {
-	ndmp_execute_cdb_reply reply;
-	struct uscsi_cmd cmd;
-	int fd;
-	struct open_list *olp;
-	char rq_buf[255];
+#ifdef __linux__
+        ndmp_execute_cdb_reply reply;
+        sg_io_hdr_t io_hdr;
+        unsigned char sense_buf[255];
+        unsigned char *datain_buf = NULL;
+        void *dxfer_buf = NULL;
+        uint32_t dxfer_len = 0;
+        int fd;
+        struct open_list *olp;
 
-	(void) memset((void *)&cmd, 0, sizeof (cmd));
-	(void) memset((void *)&reply, 0, sizeof (reply));
-	(void) memset((void *)rq_buf, 0, sizeof (rq_buf));
+        (void) memset(&io_hdr, 0, sizeof (io_hdr));
+        (void) memset(&reply, 0, sizeof (reply));
+        (void) memset(sense_buf, 0, sizeof (sense_buf));
 
-	if (request->flags == NDMP_SCSI_DATA_IN) {
-		cmd.uscsi_flags = USCSI_READ | USCSI_RQENABLE;
-		if ((cmd.uscsi_bufaddr =
-		    ndmp_malloc(request->datain_len)) == 0) {
-			reply.error = NDMP_NO_MEM_ERR;
-			if (ndmp_send_response(session->ns_connection,
-			    NDMP_NO_ERR, (void *)&reply) < 0)
-				NDMP_LOG(LOG_DEBUG, "error sending"
-				    " scsi_execute_cdb reply.");
-			return;
-		}
+        NDMP_LOG(LOG_DEBUG, "cmd: 0x%x, len: %d, flags: %d, datain_len: %d",
+            request->cdb.cdb_val[0] & 0xff, request->cdb.cdb_len,
+            request->flags, request->datain_len);
+        NDMP_LOG(LOG_DEBUG, "dataout_len: %d, timeout: %d",
+            request->dataout.dataout_len, request->timeout);
 
-		cmd.uscsi_buflen = request->datain_len;
-		cmd.uscsi_rqlen = sizeof (rq_buf);
-		cmd.uscsi_rqbuf = rq_buf;
-	} else if (request->flags == NDMP_SCSI_DATA_OUT) {
-		cmd.uscsi_flags = USCSI_WRITE;
-		cmd.uscsi_bufaddr = request->dataout.dataout_val;
-		cmd.uscsi_buflen = request->dataout.dataout_len;
-	} else {
-		cmd.uscsi_flags = USCSI_RQENABLE;
-		cmd.uscsi_bufaddr = 0;
-		cmd.uscsi_buflen = 0;
-		cmd.uscsi_rqlen = sizeof (rq_buf);
-		cmd.uscsi_rqbuf = rq_buf;
-	}
+        if (request->cdb.cdb_len > SG_MAX_CDB_SIZE) {
+                reply.error = NDMP_ILLEGAL_ARGS_ERR;
+                ndmp_send_reply(session->ns_connection, (void *)&reply,
+                    "sending execute_cdb reply");
+                return;
+        }
 
-	cmd.uscsi_timeout = (request->timeout < 1000) ?
-	    1 : (request->timeout / 1000);
+        if ((olp = ndmp_open_list_find(adapter_name, sid, lun)) != NULL) {
+                fd = olp->ol_fd;
+        } else {
+                reply.error = NDMP_DEV_NOT_OPEN_ERR;
+                ndmp_send_reply(session->ns_connection, (void *)&reply,
+                    "sending execute_cdb reply");
+                return;
+        }
 
-	cmd.uscsi_cdb = (caddr_t)request->cdb.cdb_val;
-	cmd.uscsi_cdblen = request->cdb.cdb_len;
+        switch (request->flags) {
+        case NDMP_SCSI_DATA_IN:
+                io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
+                dxfer_len = request->datain_len;
+                datain_buf = ndmp_malloc(dxfer_len);
+                if (datain_buf == NULL) {
+                        reply.error = NDMP_NO_MEM_ERR;
+                        ndmp_send_response(session->ns_connection, NDMP_NO_ERR,
+                            (void *)&reply);
+                        return;
+                }
+                dxfer_buf = datain_buf;
+                break;
+        case NDMP_SCSI_DATA_OUT:
+                io_hdr.dxfer_direction = SG_DXFER_TO_DEV;
+                dxfer_len = request->dataout.dataout_len;
+                dxfer_buf = request->dataout.dataout_val;
+                break;
+        default:
+                io_hdr.dxfer_direction = SG_DXFER_NONE;
+                dxfer_len = 0;
+                dxfer_buf = NULL;
+                break;
+        }
 
-	NDMP_LOG(LOG_DEBUG, "cmd: 0x%x, len: %d, flags: %d, datain_len: %d",
-	    request->cdb.cdb_val[0] & 0xff, request->cdb.cdb_len,
-	    request->flags, request->datain_len);
-	NDMP_LOG(LOG_DEBUG, "dataout_len: %d, timeout: %d",
-	    request->dataout.dataout_len, request->timeout);
+        io_hdr.cmdp = (unsigned char *)request->cdb.cdb_val;
+        io_hdr.cmd_len = request->cdb.cdb_len;
+        io_hdr.dxferp = dxfer_buf;
+        io_hdr.dxfer_len = dxfer_len;
+        io_hdr.sbp = sense_buf;
+        io_hdr.mx_sb_len = sizeof (sense_buf);
+        io_hdr.timeout = (request->timeout > 0) ? request->timeout : 1000;
 
-	if (request->cdb.cdb_len > 12) {
-		reply.error = NDMP_ILLEGAL_ARGS_ERR;
-		ndmp_send_reply(session->ns_connection, (void *) &reply,
-		    "sending execute_cdb reply");
-		if (request->flags == NDMP_SCSI_DATA_IN)
-			free(cmd.uscsi_bufaddr);
-		return;
-	}
+        reply.error = NDMP_NO_ERR;
 
-	reply.error = NDMP_NO_ERR;
+        if (ioctl(fd, SG_IO, &io_hdr) < 0) {
+                NDMP_LOG(LOG_ERR, "Failed to send command to device: %m");
+                NDMP_LOG(LOG_DEBUG, "ioctl(SG_IO) error: %m");
+                reply.error = NDMP_IO_ERR;
+        }
 
-	if ((olp = ndmp_open_list_find(adapter_name, sid, lun)) != NULL) {
-		fd = olp->ol_fd;
-	} else {
-		reply.error = NDMP_DEV_NOT_OPEN_ERR;
-		ndmp_send_reply(session->ns_connection, (void *) &reply,
-		    "sending execute_cdb reply");
-		if (request->flags == NDMP_SCSI_DATA_IN)
-			free(cmd.uscsi_bufaddr);
-		return;
-	}
+        reply.status = io_hdr.status;
 
-	if (ioctl(fd, USCSICMD, &cmd) < 0) {
-		NDMP_LOG(LOG_ERR, "Failed to send command to device: %m");
-		NDMP_LOG(LOG_DEBUG, "ioctl(USCSICMD) error: %m");
-		if (cmd.uscsi_status != 0)
-			reply.error = NDMP_IO_ERR;
-	}
+        if (request->flags == NDMP_SCSI_DATA_IN) {
+                reply.datain.datain_len = io_hdr.dxfer_len - io_hdr.resid;
+                reply.datain.datain_val = (char *)datain_buf;
+        } else {
+                reply.dataout_len = request->dataout.dataout_len;
+        }
 
-	reply.status = cmd.uscsi_status;
+        reply.ext_sense.ext_sense_len = io_hdr.sb_len_wr;
+        reply.ext_sense.ext_sense_val = (char *)sense_buf;
 
-	if (request->flags == NDMP_SCSI_DATA_IN) {
-		reply.datain.datain_len = cmd.uscsi_buflen;
-		reply.datain.datain_val = cmd.uscsi_bufaddr;
-	} else {
-		reply.dataout_len = request->dataout.dataout_len;
-	}
+        if (ndmp_send_response(session->ns_connection, NDMP_NO_ERR,
+            (void *)&reply) < 0)
+                NDMP_LOG(LOG_DEBUG, "Error sending scsi_execute_cdb reply.");
 
-	reply.ext_sense.ext_sense_len = cmd.uscsi_rqlen - cmd.uscsi_rqresid;
-	reply.ext_sense.ext_sense_val = rq_buf;
+        if (request->flags == NDMP_SCSI_DATA_IN)
+                free(datain_buf);
+#else
+        ndmp_execute_cdb_reply reply;
+        struct uscsi_cmd cmd;
+        int fd;
+        struct open_list *olp;
+        char rq_buf[255];
 
-	if (ndmp_send_response(session->ns_connection, NDMP_NO_ERR,
-	    (void *)&reply) < 0)
-		NDMP_LOG(LOG_DEBUG, "Error sending scsi_execute_cdb reply.");
+        (void) memset((void *)&cmd, 0, sizeof (cmd));
+        (void) memset((void *)&reply, 0, sizeof (reply));
+        (void) memset((void *)rq_buf, 0, sizeof (rq_buf));
 
-	if (request->flags == NDMP_SCSI_DATA_IN)
-		free(cmd.uscsi_bufaddr);
+        if (request->flags == NDMP_SCSI_DATA_IN) {
+                cmd.uscsi_flags = USCSI_READ | USCSI_RQENABLE;
+                if ((cmd.uscsi_bufaddr =
+                    ndmp_malloc(request->datain_len)) == 0) {
+                        reply.error = NDMP_NO_MEM_ERR;
+                        if (ndmp_send_response(session->ns_connection,
+                            NDMP_NO_ERR, (void *)&reply) < 0)
+                                NDMP_LOG(LOG_DEBUG, "error sending"
+                                    " scsi_execute_cdb reply.");
+                        return;
+                }
+
+                cmd.uscsi_buflen = request->datain_len;
+                cmd.uscsi_rqlen = sizeof (rq_buf);
+                cmd.uscsi_rqbuf = rq_buf;
+        } else if (request->flags == NDMP_SCSI_DATA_OUT) {
+                cmd.uscsi_flags = USCSI_WRITE;
+                cmd.uscsi_bufaddr = request->dataout.dataout_val;
+                cmd.uscsi_buflen = request->dataout.dataout_len;
+        } else {
+                cmd.uscsi_flags = USCSI_RQENABLE;
+                cmd.uscsi_bufaddr = 0;
+                cmd.uscsi_buflen = 0;
+                cmd.uscsi_rqlen = sizeof (rq_buf);
+                cmd.uscsi_rqbuf = rq_buf;
+        }
+
+        cmd.uscsi_timeout = (request->timeout < 1000) ?
+            1 : (request->timeout / 1000);
+
+        cmd.uscsi_cdb = (caddr_t)request->cdb.cdb_val;
+        cmd.uscsi_cdblen = request->cdb.cdb_len;
+
+        NDMP_LOG(LOG_DEBUG, "cmd: 0x%x, len: %d, flags: %d, datain_len: %d",
+            request->cdb.cdb_val[0] & 0xff, request->cdb.cdb_len,
+            request->flags, request->datain_len);
+        NDMP_LOG(LOG_DEBUG, "dataout_len: %d, timeout: %d",
+            request->dataout.dataout_len, request->timeout);
+
+        if (request->cdb.cdb_len > 12) {
+                reply.error = NDMP_ILLEGAL_ARGS_ERR;
+                ndmp_send_reply(session->ns_connection, (void *) &reply,
+                    "sending execute_cdb reply");
+                if (request->flags == NDMP_SCSI_DATA_IN)
+                        free(cmd.uscsi_bufaddr);
+                return;
+        }
+
+        reply.error = NDMP_NO_ERR;
+
+        if ((olp = ndmp_open_list_find(adapter_name, sid, lun)) != NULL) {
+                fd = olp->ol_fd;
+        } else {
+                reply.error = NDMP_DEV_NOT_OPEN_ERR;
+                ndmp_send_reply(session->ns_connection, (void *) &reply,
+                    "sending execute_cdb reply");
+                if (request->flags == NDMP_SCSI_DATA_IN)
+                        free(cmd.uscsi_bufaddr);
+                return;
+        }
+
+        if (ioctl(fd, USCSICMD, &cmd) < 0) {
+                NDMP_LOG(LOG_ERR, "Failed to send command to device: %m");
+                NDMP_LOG(LOG_DEBUG, "ioctl(USCSICMD) error: %m");
+                if (cmd.uscsi_status != 0)
+                        reply.error = NDMP_IO_ERR;
+        }
+
+        reply.status = cmd.uscsi_status;
+
+        if (request->flags == NDMP_SCSI_DATA_IN) {
+                reply.datain.datain_len = cmd.uscsi_buflen;
+                reply.datain.datain_val = cmd.uscsi_bufaddr;
+        } else {
+                reply.dataout_len = request->dataout.dataout_len;
+        }
+
+        reply.ext_sense.ext_sense_len = cmd.uscsi_rqlen - cmd.uscsi_rqresid;
+        reply.ext_sense.ext_sense_val = rq_buf;
+
+        if (ndmp_send_response(session->ns_connection, NDMP_NO_ERR,
+            (void *)&reply) < 0)
+                NDMP_LOG(LOG_DEBUG, "Error sending scsi_execute_cdb reply.");
+
+        if (request->flags == NDMP_SCSI_DATA_IN)
+                free(cmd.uscsi_bufaddr);
+#endif
 }
 
 
